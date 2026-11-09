@@ -1,42 +1,41 @@
 # bash-allow-hook
 
-PreToolUse-хук Claude Code для Bash. Одобряет команды с `for`/`while`/`if`/`case`,
-heredoc, присваиваниями переменных, функциями и подоболочками, если **каждая**
-команда внутри совпадает с allow-правилами из `~/.claude/settings.json`.
-Встроенные правила Claude Code такие конструкции не одобряют никогда, и в auto mode
-они уходят в классификатор.
+A Claude Code PreToolUse hook for Bash. It approves commands that use `for`/`while`/`if`/`case`,
+heredocs, variable assignments, functions and subshells when **every** command inside matches
+the allow rules in `~/.claude/settings.json`. Claude Code's built-in rules never approve such
+constructs, so in auto mode they always go to the classifier.
 
-На всё остальное хук молчит, и решает обычный поток: native-правила или классификатор.
-Хук никогда не отвечает `deny` или `ask`.
+For anything else the hook stays silent and the normal flow decides: native rules or the classifier.
+The hook never answers `deny` or `ask`.
 
-## Как решает
+## How it decides
 
-1. Разбирает команду через tree-sitter-bash. При ошибке разбора молчит.
-   Так же он молчит на синтаксис только для zsh: `*(e:…:)`, `=(…)`, `${(e)x}`.
-2. Обходит дерево: тела циклов и ветвей, `$(...)`, `<(...)`, потребители heredoc, функции.
-3. У каждой команды снимает обёртки, которые снимает и Claude Code
-   (`timeout`, `time`, `nice`, `nohup`, `stdbuf`, `command`, `builtin`, `noglob`, голый `xargs`),
-   и сверяет её с allow-правилами. `Bash(x *)` — префикс, `Bash(x)` — точное совпадение.
-   Правила, которые auto mode отбрасывает (`Bash(*)`, интерпретаторы, `npm run`), игнорируются.
-   Если команда может совпасть с правилом из deny или ask, хук молчит.
-4. `allow` возвращается, только если всё прошло проверки и в команде есть хотя бы одна
-   такая конструкция. Простые команды решают native-правила.
+1. Parses the command with tree-sitter-bash and stays silent on a parse error.
+   It also stays silent on zsh-only syntax: `*(e:…:)`, `=(…)`, `${(e)x}`.
+2. Walks the tree: loop and branch bodies, `$(...)`, `<(...)`, heredoc consumers, functions.
+3. Strips from each command the same wrappers Claude Code strips
+   (`timeout`, `time`, `nice`, `nohup`, `stdbuf`, `command`, `builtin`, `noglob`, bare `xargs`)
+   and checks it against the allow rules. `Bash(x *)` is a prefix match, `Bash(x)` is an exact match.
+   Rules that auto mode drops (`Bash(*)`, interpreters, `npm run`) are ignored.
+   If a command could match a deny or ask rule, the hook stays silent.
+4. Returns `allow` only when everything passes and the command contains at least one such
+   construct. Simple commands are left to the native rules.
 
-Отказ (хук молчит):
+The hook stays silent on:
 
-- арифметика `$((…))`, `((…))`, индексы массивов, `${x@P}`: через подстановки в них
-  выполняется код;
-- `-eq`/`-lt`/… с нелитеральными операндами;
-- присваивание специальных переменных bash/zsh (`PATH`/`path`, `IFS`, `PS4`, `*_functions`,
-  `aliases`, `commands`, `mapfile`, …) и переменных, которые уже есть в окружении;
-- `export` и префиксные `X=v cmd` для всего, кроме `LC_*`, `LANG`, `TZ` и подобных;
-- `&` (фоновые задачи), `coproc`, `find -exec/-delete`, нелитеральное имя команды;
-- функции-хуки zsh и bash (`TRAP*`, `chpwd`, `precmd`, `command_not_found_handler`, …);
-- запись через `>` куда-либо, кроме `/dev/null`, `/tmp`, `/private/tmp` и `$TMPDIR`
-  (литеральный путь или `"$TMPDIR/…"`; значение берётся из окружения хука и учитывается,
-  только если указывает в `/var/folders` или `/tmp`).
+- arithmetic `$((…))`, `((…))`, array subscripts and `${x@P}`: substitutions inside them
+  execute code;
+- `-eq`/`-lt`/… with non-literal operands;
+- assignments to special bash/zsh variables (`PATH`/`path`, `IFS`, `PS4`, `*_functions`,
+  `aliases`, `commands`, `mapfile`, …) and to variables that already exist in the environment;
+- `export` and prefix `X=v cmd` for anything except `LC_*`, `LANG`, `TZ` and similar;
+- `&` (background jobs), `coproc`, `find -exec/-delete`, non-literal command names;
+- zsh and bash hook functions (`TRAP*`, `chpwd`, `precmd`, `command_not_found_handler`, …);
+- `>` redirects to anything other than `/dev/null`, `/tmp`, `/private/tmp` and `$TMPDIR`
+  (a literal path or `"$TMPDIR/…"`; the value comes from the hook's environment and is used
+  only if it points into `/var/folders` or `/tmp`).
 
-## Установка
+## Install
 
 ```sh
 cargo install --path .
@@ -53,14 +52,18 @@ cargo install --path .
 }
 ```
 
-Отключить без правки настроек: переменная окружения `BASH_ALLOW_HOOK_DISABLE=1`.
+To disable it without editing settings, set the environment variable `BASH_ALLOW_HOOK_DISABLE=1`.
 
-## Отладка
+## Debugging
 
 ```sh
-printf '%s' 'for f in a b; do grep x "$f"; done' | bash-allow-hook explain   # ALLOW или PASS: причина
-cargo run --example dump <<< 'cmd'                                          # дерево разбора
+printf '%s' 'for f in a b; do grep x "$f"; done' | bash-allow-hook explain   # ALLOW or PASS: reason
+cargo run --example dump <<< 'cmd'                                          # parse tree
 cargo test
 ```
 
-В транскрипте сессии одобренные хуком вызовы помечены `permissionDecision.reasonType = "hook"`.
+In the session transcript, calls approved by the hook have `permissionDecision.reasonType = "hook"`.
+
+## License
+
+[MIT](LICENSE)
