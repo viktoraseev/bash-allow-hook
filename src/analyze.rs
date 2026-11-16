@@ -1,8 +1,14 @@
 //! Decides whether a shell command is safe to approve: every command inside it,
 //! including loop and branch bodies, heredoc consumers and `$(...)`, must match
 //! an allow rule. Anything the walker does not understand makes it pass.
+//!
+//! `cd` counts as a construct too: Claude Code sends `cd <dir> && ...` to the
+//! classifier unless `<dir>` is an absolute path inside the session directory.
+//! The hook approves a `cd` whose target resolves inside the session directory,
+//! `additionalDirectories`, an `Edit(<dir>/**)` allow rule or a temp directory.
 
 use crate::rules::Rules;
+use std::path::{Component, Path, PathBuf};
 use tree_sitter::{Node, Parser};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -66,7 +72,13 @@ const SPECIAL_PREFIXES: &[&str] = &[
 
 /// `env_get` returns an environment variable as the shell sees it
 /// (the hook inherits Claude Code's environment, which the Bash tool shell shares).
-pub fn analyze(cmd: &str, rules: &Rules, env_get: &dyn Fn(&str) -> Option<String>) -> Verdict {
+/// `cwd` is the directory the command starts in; relative `cd` targets need it.
+pub fn analyze(
+    cmd: &str,
+    rules: &Rules,
+    env_get: &dyn Fn(&str) -> Option<String>,
+    cwd: Option<&str>,
+) -> Verdict {
     if cmd.len() > 10_000 {
         return Verdict::Pass("command longer than 10000 chars".into());
     }
@@ -91,19 +103,88 @@ pub fn analyze(cmd: &str, rules: &Rules, env_get: &dyn Fn(&str) -> Option<String
     if root.has_error() {
         return Verdict::Pass("parse error (or zsh-only syntax)".into());
     }
+    let tmpdir = env_get("TMPDIR").filter(|t| is_temp_dir(t));
+    let cwd = cwd.filter(|c| c.starts_with('/')).map(PathBuf::from);
+    let home = env_get("HOME");
+    let mut roots: Vec<PathBuf> = vec!["/tmp".into(), "/private/tmp".into()];
+    roots.extend(tmpdir.iter().map(PathBuf::from));
+    roots.extend(cwd.clone());
+    roots.extend(rules.dirs().iter().filter_map(|d| expand(d, home.as_deref())));
+    let roots: Vec<PathBuf> = roots.iter().map(|r| physical(r)).filter(|r| r.parent().is_some()).collect();
     let mut ctx = Ctx {
         src: src.as_bytes(),
         rules,
         env_get,
-        tmpdir: env_get("TMPDIR").filter(|t| is_temp_dir(t)),
+        tmpdir,
         gap: false,
         functions: Vec::new(),
+        cwd,
+        roots,
+        loop_depth: 0,
+        cd_seen: false,
+        git_seen: false,
+        sed_in_place: false,
     };
     match ctx.node(root) {
         Err(reason) => Verdict::Pass(reason),
+        Ok(()) if ctx.cd_seen && ctx.git_seen => {
+            Verdict::Pass("git with cd: hooks and config of the target repo may run".into())
+        }
+        Ok(()) if ctx.cd_seen && ctx.sed_in_place => {
+            Verdict::Pass("sed -i with cd: writes files in the target dir".into())
+        }
         Ok(()) if ctx.gap => Verdict::Allow,
-        Ok(()) => Verdict::Pass("no loop/branch/heredoc/assignment; native rules decide".into()),
+        Ok(()) => Verdict::Pass("no cd/loop/branch/heredoc/assignment; native rules decide".into()),
     }
+}
+
+/// `~` and `~/x` expand to `$HOME`; absolute paths stay; anything else is None.
+fn expand(p: &str, home: Option<&str>) -> Option<PathBuf> {
+    if p.starts_with('/') {
+        return Some(PathBuf::from(p));
+    }
+    let home = home.filter(|h| h.starts_with('/'))?;
+    match p {
+        "~" => Some(PathBuf::from(home)),
+        _ => Some(Path::new(home).join(p.strip_prefix("~/")?)),
+    }
+}
+
+/// Resolves `.` and `..` by text, as `cd` does by default (logical paths).
+fn lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The real location: symlinks resolved in the longest existing prefix.
+fn physical(p: &Path) -> PathBuf {
+    let p = lexical(p);
+    let comps: Vec<Component> = p.components().collect();
+    for i in (1..=comps.len()).rev() {
+        let prefix: PathBuf = comps[..i].iter().collect();
+        if let Ok(real) = std::fs::canonicalize(&prefix) {
+            let rest: PathBuf = comps[i..].iter().collect();
+            return if rest.as_os_str().is_empty() { real } else { real.join(rest) };
+        }
+    }
+    p
+}
+
+/// `sed -i`, `-ni`, `-i.bak`, `--in-place[=...]`. Short flag clusters are
+/// matched loosely: any `i` in them counts.
+fn is_sed_in_place(w: &str) -> bool {
+    w == "--in-place"
+        || w.starts_with("--in-place=")
+        || (w.len() > 1 && w.starts_with('-') && !w.starts_with("--") && w[1..].contains('i'))
 }
 
 struct Ctx<'a> {
@@ -116,6 +197,15 @@ struct Ctx<'a> {
     gap: bool,
     /// Functions defined earlier in this command whose bodies passed the checks.
     functions: Vec<String>,
+    /// Directory the command starts in.
+    cwd: Option<PathBuf>,
+    /// Real paths a `cd` may enter (with everything below them).
+    roots: Vec<PathBuf>,
+    /// Inside a loop or function body: code there may run more than once.
+    loop_depth: usize,
+    cd_seen: bool,
+    git_seen: bool,
+    sed_in_place: bool,
 }
 
 fn render(words: &[Option<String>]) -> String {
@@ -194,8 +284,8 @@ impl<'a> Ctx<'a> {
         match kind {
             "program" | "list" | "pipeline" | "redirected_statement" | "comment" | "compound_statement"
             | "subshell" | "negated_command" | "if_statement" | "elif_clause" | "else_clause"
-            | "while_statement" | "do_group" | "case_statement"
-            | "variable_assignments" => self.children(n),
+            | "do_group" | "case_statement" | "variable_assignments" => self.children(n),
+            "while_statement" => self.in_loop(|s| s.children(n)),
             // case patterns only match strings, they never expand to file names
             "case_item" => {
                 let mut c = n.walk();
@@ -208,7 +298,7 @@ impl<'a> Ctx<'a> {
                 if let Some(v) = n.child_by_field_name("variable") {
                     self.check_plain_name(self.text(v))?;
                 }
-                self.children_except(n, "variable")
+                self.in_loop(|s| s.children_except(n, "variable"))
             }
             "command" => self.command(n),
             "function_definition" => {
@@ -219,7 +309,7 @@ impl<'a> Ctx<'a> {
                     return Err(format!("function name not allowed: {name}"));
                 }
                 self.functions.push(name.to_string());
-                self.children_except(n, "name")
+                self.in_loop(|s| s.children_except(n, "name"))
             }
             "variable_assignment" => self.assignment(n, false),
             "declaration_command" => self.declaration(n),
@@ -232,6 +322,13 @@ impl<'a> Ctx<'a> {
             | "simple_expansion" | "expansion" | "command_substitution" | "brace_expression" => self.word(n),
             k => Err(format!("unsupported construct: {k}")),
         }
+    }
+
+    fn in_loop(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.loop_depth += 1;
+        let r = f(self);
+        self.loop_depth -= 1;
+        r
     }
 
     fn children(&mut self, n: Node) -> R {
@@ -459,6 +556,12 @@ impl<'a> Ctx<'a> {
             return Ok(());
         }
         match name.as_str() {
+            "cd" => self.cd(&words)?,
+            "git" => self.git_seen = true,
+            "sed" if words[1..].iter().flatten().any(|w| is_sed_in_place(w)) => self.sed_in_place = true,
+            _ => {}
+        }
+        match name.as_str() {
             n if SAFE_BUILTINS.contains(&n) => return Ok(()),
             "command" => return Ok(()), // only `command -v/-V` reaches here
             "read" => return self.read_builtin(&words),
@@ -472,6 +575,44 @@ impl<'a> Ctx<'a> {
         if !self.rules.allows(&words) {
             return Err(format!("not in allow rules: {}", render(&words)));
         }
+        Ok(())
+    }
+
+    /// Accepts `cd [-L] [--] <dir>` when `<dir>` is a literal path that resolves
+    /// inside one of the roots. A relative target is resolved against the
+    /// starting directory, so it must be the first `cd` and outside loops.
+    fn cd(&mut self, words: &[Option<String>]) -> R {
+        let mut args = Vec::new();
+        for w in &words[1..] {
+            match w.as_deref() {
+                Some("-L" | "--") => {}
+                Some(o) if o.starts_with('-') => return Err(format!("cd option not supported: {o}")),
+                _ => args.push(w),
+            }
+        }
+        let [target] = args.as_slice() else {
+            return Err("cd needs exactly one target".into());
+        };
+        let target = target.as_deref().ok_or("non-literal cd target")?;
+        let path = if target.starts_with('/') || target == "~" || target.starts_with("~/") {
+            expand(target, (self.env_get)("HOME").as_deref()).ok_or("cd target needs HOME")?
+        } else if target.starts_with('~') {
+            return Err(format!("cd to a named directory: {target}"));
+        } else {
+            if self.cd_seen || self.loop_depth > 0 {
+                return Err(format!("relative cd after another cd or in a loop: {target}"));
+            }
+            if (self.env_get)("CDPATH").is_some() || (self.env_get)("cdpath").is_some() {
+                return Err("relative cd with CDPATH set".into());
+            }
+            self.cwd.as_ref().ok_or("relative cd without a starting directory")?.join(target)
+        };
+        let real = physical(&path);
+        if !self.roots.iter().any(|r| real.starts_with(r)) {
+            return Err(format!("cd outside allowed dirs: {}", real.display()));
+        }
+        self.cd_seen = true;
+        self.gap = true;
         Ok(())
     }
 

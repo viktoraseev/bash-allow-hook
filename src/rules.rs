@@ -18,6 +18,22 @@ pub struct Rules {
     /// deny + ask rules as word prefixes; the last word may be partial.
     block: Vec<Vec<String>>,
     block_all: bool,
+    /// Directories a `cd` may enter: `additionalDirectories` and the roots of
+    /// `Edit(~/x/**)` / `Edit(//x/**)` allow rules. Absolute or `~`-prefixed.
+    dirs: Vec<String>,
+}
+
+/// `Edit(~/wt/**)` -> `~/wt`, `Edit(//tmp/**)` -> `/tmp`. Other forms
+/// (relative to a settings file, globs inside the path) are ignored.
+fn edit_root(rule: &str) -> Option<String> {
+    let base = rule.strip_prefix("Edit(")?.strip_suffix(')')?.strip_suffix("/**")?;
+    if base.contains(['*', '?', '[', '{']) {
+        return None;
+    }
+    if let Some(abs) = base.strip_prefix("//") {
+        return (!abs.is_empty()).then(|| format!("/{abs}"));
+    }
+    (base == "~" || base.starts_with("~/")).then(|| base.to_string())
 }
 
 /// Rules that auto mode drops because they grant arbitrary code execution.
@@ -58,6 +74,24 @@ impl Rules {
         r
     }
 
+    /// Adds `additionalDirectories` entries.
+    pub fn with_dirs(mut self, dirs: &[&str]) -> Self {
+        dirs.iter().for_each(|d| self.add_dir(d));
+        self
+    }
+
+    fn add_dir(&mut self, d: &str) {
+        let d = d.trim().trim_end_matches('/');
+        if d.starts_with('/') || d == "~" || d.starts_with("~/") {
+            self.dirs.push(d.to_string());
+        }
+    }
+
+    /// Directories a `cd` may enter, as written in settings (`~` not expanded).
+    pub fn dirs(&self) -> &[String] {
+        &self.dirs
+    }
+
     /// Loads `settings.json` and `settings.local.json` from `$CLAUDE_CONFIG_DIR` or `~/.claude`.
     pub fn load() -> Self {
         let dir = std::env::var_os("CLAUDE_CONFIG_DIR")
@@ -72,6 +106,9 @@ impl Rules {
             for s in perms["allow"].as_array().into_iter().flatten().filter_map(Value::as_str) {
                 r.add_allow(s);
             }
+            for d in perms["additionalDirectories"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                r.add_dir(d);
+            }
             for key in ["deny", "ask"] {
                 for s in perms[key].as_array().into_iter().flatten().filter_map(Value::as_str) {
                     r.add_block(s);
@@ -82,6 +119,10 @@ impl Rules {
     }
 
     fn add_allow(&mut self, rule: &str) {
+        if let Some(root) = edit_root(rule.trim()) {
+            self.dirs.push(root);
+            return;
+        }
         let Some(inner) = bash_inner(rule.trim()) else { return };
         let inner = inner.trim();
         if inner.is_empty() || inner.contains(['"', '\'', '\\']) {

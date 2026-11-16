@@ -2,7 +2,8 @@
 //! `allow` decision only when every command inside a Bash call matches the
 //! user's allow rules; otherwise prints nothing and the normal flow decides.
 //!
-//! `bash-allow-hook explain` reads a raw command from stdin and prints the verdict.
+//! `bash-allow-hook explain` reads a raw command from stdin and prints the verdict
+//! for a command started in the current directory.
 
 use bash_allow_hook::{Rules, Verdict, analyze};
 use serde_json::{Value, json};
@@ -22,7 +23,8 @@ fn run_explain() {
     let mut cmd = String::new();
     let _ = std::io::stdin().read_to_string(&mut cmd);
     let cmd = cmd.strip_suffix('\n').unwrap_or(&cmd);
-    match analyze(cmd, &Rules::load(), &env_get) {
+    let cwd = std::env::current_dir().ok().map(|d| d.to_string_lossy().into_owned());
+    match analyze(cmd, &Rules::load(), &env_get, cwd.as_deref()) {
         Verdict::Allow => println!("ALLOW"),
         Verdict::Pass(why) => println!("PASS: {why}"),
     }
@@ -41,7 +43,7 @@ fn run_hook() {
         return;
     }
     let Some(cmd) = v["tool_input"]["command"].as_str() else { return };
-    if analyze(cmd, &Rules::load(), &env_get) == Verdict::Allow {
+    if analyze(cmd, &Rules::load(), &env_get, v["cwd"].as_str()) == Verdict::Allow {
         let out = json!({"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",

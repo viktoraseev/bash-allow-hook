@@ -1,9 +1,11 @@
 # bash-allow-hook
 
 A Claude Code PreToolUse hook for Bash. It approves commands that use `for`/`while`/`if`/`case`,
-heredocs, variable assignments, functions and subshells when **every** command inside matches
-the allow rules in `~/.claude/settings.json`. Claude Code's built-in rules never approve such
-constructs, so in auto mode they always go to the classifier.
+heredocs, variable assignments, functions, subshells and `cd` when **every** command inside
+matches the allow rules in `~/.claude/settings.json`. Claude Code's built-in rules never approve
+such constructs, so in auto mode they always go to the classifier. For `cd` the built-in rules
+approve only an absolute path inside the session directory: a relative `cd`, a `cd` into an
+`additionalDirectories` entry and a `cd` anywhere else go to the classifier even with `Bash(cd *)`.
 
 For anything else the hook stays silent and the normal flow decides: native rules or the classifier.
 The hook never answers `deny` or `ask`.
@@ -18,8 +20,28 @@ The hook never answers `deny` or `ask`.
    and checks it against the allow rules. `Bash(x *)` is a prefix match, `Bash(x)` is an exact match.
    Rules that auto mode drops (`Bash(*)`, interpreters, `npm run`) are ignored.
    If a command could match a deny or ask rule, the hook stays silent.
-4. Returns `allow` only when everything passes and the command contains at least one such
+4. Checks each `cd` (see below).
+5. Returns `allow` only when everything passes and the command contains at least one such
    construct. Simple commands are left to the native rules.
+
+### `cd`
+
+A `cd` counts as a construct when `Bash(cd *)` allows it and its target resolves inside one of:
+
+- the directory the command starts in (`cwd` from the hook input);
+- `permissions.additionalDirectories`;
+- the root of an `Edit(~/dir/**)` or `Edit(//dir/**)` allow rule: if Claude may edit files there
+  without the classifier, it may also `cd` there and read them;
+- `/tmp`, `/private/tmp` and `$TMPDIR`.
+
+The target is resolved like `cd` does by default (`..` by text), then symlinks are followed in the
+part that exists, so a symlink cannot lead outside. The hook stays silent on:
+
+- a non-literal target (`cd "$d"`), `cd` without a target, `cd -`, `cd -P`, `cd ~user`, `cd old new`;
+- a relative target after another `cd`, inside a loop or function body, with `CDPATH` set,
+  or when the hook input has no `cwd`;
+- `git` anywhere in a command with `cd`: the target repo's hooks and config may run;
+- `sed -i` anywhere in a command with `cd`.
 
 The hook stays silent on:
 

@@ -7,24 +7,34 @@ fn rules() -> Rules {
             "Bash(echo *)", "Bash(printf *)", "Bash(jq *)", "Bash(sed *)", "Bash(sort *)",
             "Bash(find *)", "Bash(sleep *)", "Bash(date *)", "Bash(mkdir *)", "Bash(pwd)",
             "Bash(git status *)", "Bash(git log *)", "Bash(git branch)", "Bash(rg *)",
-            "Bash(./tracker.sh *)", "Bash(./sql.sh *)",
+            "Bash(./tracker.sh *)", "Bash(./sql.sh *)", "Bash(arc status *)",
             "Bash(kubectl --context prod get *)",
             // auto mode drops these; the hook must ignore them too
             "Bash(python3 *)", "Bash(bash *)", "Bash(npm run *)", "Bash(*)", "Bash(xargs *)",
+            // roots a `cd` may enter
+            "Edit(~/wt/**)", "Edit(//opt/data/**)",
+            // not roots: relative to a settings file, or a glob inside
+            "Edit(src/**)", "Edit(~/x*/**)",
         ],
         &["Bash(rm *)", "Bash(git push:*)"],
     )
+    .with_dirs(&["/srv/extra"])
 }
 
 const TMP: &str = "/var/folders/xx/abc/T/";
+const CWD: &str = "/Users/me/proj";
 
-/// Only TMPDIR is set, as on macOS.
+/// Only TMPDIR and HOME are set, as on macOS.
 fn no_env(name: &str) -> Option<String> {
-    (name == "TMPDIR").then(|| TMP.to_string())
+    match name {
+        "TMPDIR" => Some(TMP.to_string()),
+        "HOME" => Some("/Users/me".to_string()),
+        _ => None,
+    }
 }
 
 fn verdict(cmd: &str) -> Verdict {
-    analyze(cmd, &rules(), &no_env)
+    analyze(cmd, &rules(), &no_env, Some(CWD))
 }
 
 #[track_caller]
@@ -78,8 +88,84 @@ fn heredocs() {
 #[test]
 fn simple_commands_are_left_to_native_rules() {
     pass("ls | head -1");
-    pass("cd /tmp && arc status");
+    pass("arc status && ls /tmp");
     pass(r#"echo "$(date)""#);
+}
+
+#[test]
+fn cd_into_allowed_dirs() {
+    allow("cd /Users/me/proj/sub && ls");
+    allow("cd sub && cat a.txt");
+    allow("cd ./sub/../other && ls");
+    allow("cd ~/wt/6/adv && grep -n x f.java | head -5");
+    allow("cd /Users/me/wt/6 && arc status");
+    allow("cd /tmp/x && ls");
+    allow("cd /private/tmp/x; ls 2>/dev/null");
+    allow("cd /var/folders/xx/abc/T/job && ls");
+    allow("cd /srv/extra/a && ls");
+    allow("cd /opt/data && ls");
+    allow("cd -L ~/wt/a && ls; cd ~/wt/b && ls");
+    allow("cd /tmp/a && cd /tmp/b && ls");
+    allow("timeout 5 cd ~/wt/a && ls");
+    allow("cd /tmp && ls > /tmp/out.txt");
+}
+
+#[test]
+fn cd_elsewhere_or_unclear() {
+    pass("cd /etc && ls");
+    pass("cd /Users/me && ls");
+    pass("cd ~ && ls");
+    pass("cd && ls");
+    pass("cd - && ls");
+    pass("cd -P ~/wt/a && ls");
+    pass("cd ~/wt/../.ssh && ls");
+    pass("cd ~/xyz && ls");
+    pass("cd /Users/me/proj/../other && ls");
+    pass("cd ~other/x && ls");
+    pass("cd /Users/me/src && ls");
+    pass(r#"cd "$d" && ls"#);
+    pass("cd /tmp/$d && ls");
+    pass("cd old new && ls");
+    // a relative target is resolved against the starting directory only
+    pass("cd /tmp/a && cd sub && ls");
+    pass("for d in a b; do cd sub; ls; done");
+    pass("f() { cd sub; }; f; f");
+    // what follows the cd still has to be allowed
+    pass("cd /tmp && curl x");
+    pass("cd /tmp && ls > out.txt");
+    // without a starting directory or with CDPATH a relative cd is unclear
+    assert!(matches!(analyze("cd sub && ls", &rules(), &no_env, None), Verdict::Pass(_)));
+    let cdpath = |n: &str| match n {
+        "CDPATH" => Some("/etc".to_string()),
+        _ => no_env(n),
+    };
+    assert!(matches!(analyze("cd sub && ls", &rules(), &cdpath, Some(CWD)), Verdict::Pass(_)));
+}
+
+#[test]
+fn cd_with_git_or_sed_in_place() {
+    pass("cd /tmp/repo && git status");
+    pass("git log -n1; cd /tmp");
+    pass("cd /tmp/x && sed -i 's/a/b/' f");
+    pass("cd /tmp/x && sed -ni.bak 'p' f");
+    pass("cd /tmp/x && sed --in-place=.bak 's/a/b/' f");
+    allow("cd /tmp/x && sed -n '1,5p' f");
+    allow("for f in a; do sed -i 's/a/b/' /tmp/$f; done");
+}
+
+#[test]
+fn cd_follows_symlinks() {
+    let base = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("cd-symlink");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("root/real")).unwrap();
+    std::fs::create_dir_all(base.join("outside")).unwrap();
+    std::os::unix::fs::symlink(base.join("outside"), base.join("root/link")).unwrap();
+    let root = base.join("root");
+    let r = rules().with_dirs(&[root.to_str().unwrap()]);
+    let v = |cmd: String| analyze(&cmd, &r, &no_env, Some(CWD));
+    assert_eq!(v(format!("cd {}/real && ls", root.display())), Verdict::Allow);
+    assert!(matches!(v(format!("cd {}/link && ls", root.display())), Verdict::Pass(_)));
+    assert!(matches!(v(format!("cd {}/link/new && ls", root.display())), Verdict::Pass(_)));
 }
 
 #[test]
@@ -133,8 +219,8 @@ fn dangerous_variables() {
     pass("export -f x; ls");
     // a variable that already exists in the environment would be exported
     let env = |n: &str| (n == "EDITOR").then(|| "vim".to_string());
-    assert!(matches!(analyze("EDITOR=vim; ls", &rules(), &env), Verdict::Pass(_)));
-    assert_eq!(analyze("editor=vim; ls", &rules(), &env), Verdict::Allow);
+    assert!(matches!(analyze("EDITOR=vim; ls", &rules(), &env, Some(CWD)), Verdict::Pass(_)));
+    assert_eq!(analyze("editor=vim; ls", &rules(), &env, Some(CWD)), Verdict::Allow);
 }
 
 #[test]
@@ -233,7 +319,7 @@ fn tmpdir_redirects() {
     // TMPDIR outside temp locations is ignored
     let env = |n: &str| (n == "TMPDIR").then(|| "/Users/me/".to_string());
     assert!(matches!(
-        analyze(r#"for x in a; do echo $x; done > "$TMPDIR/x""#, &rules(), &env),
+        analyze(r#"for x in a; do echo $x; done > "$TMPDIR/x""#, &rules(), &env, Some(CWD)),
         Verdict::Pass(_)
     ));
 }

@@ -3,7 +3,7 @@ name = "bash-allow-hook"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Claude Code PreToolUse hook that approves Bash loops, branches, heredocs and assignments built only from allowed commands"
+description = "Claude Code PreToolUse hook that approves Bash loops, branches, heredocs, assignments and cd built only from allowed commands"
 repository = "https://github.com/viktoraseev/bash-allow-hook"
 
 [dependencies]
